@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cline-desktop-linux"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cline-desktop-linux"
+APP_HOME="${CLINE_DESKTOP_LINUX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/cline-desktop-linux}"
+mkdir -p "$STATE_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+CLINE_SOURCE="${CLINE_SOURCE:-$HOME/Documents/cline-desktop}"
+DEFAULT_MODE="${DEFAULT_MODE:-native}"
+[[ "$DEFAULT_MODE" == desktop ]] && DEFAULT_MODE=native
+NATIVE_SOURCE="${NATIVE_SOURCE:-auto}"
+NATIVE_RELEASE_REPO="${NATIVE_RELEASE_REPO:-nekomario28/cline-desktop-linux}"
+NATIVE_RELEASE_TAG="${NATIVE_RELEASE_TAG:-}"
+DESKTOP_APP="$CLINE_SOURCE/apps/examples/desktop-app"
+BUN="${BUN_BIN:-$HOME/.bun/bin/bun}"
+NODE="${NODE_BIN:-$(command -v node 2>/dev/null || true)}"
+NODE_DIR="/usr/bin"
+[[ -n "$NODE" ]] && NODE_DIR="$(dirname "$NODE")"
+RUNTIME_PATH="$APP_HOME/bin:$NODE_DIR:$HOME/.bun/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+NATIVE_ROOT="$APP_HOME/native/current"
+NATIVE_BIN="$NATIVE_ROOT/usr/bin/cline-app"
+NATIVE_SIDECAR="$NATIVE_ROOT/usr/bin/code-sidecar"
+NATIVE_META="$NATIVE_ROOT/.cline-desktop-linux-release"
+
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+LEGACY_UNITS=(
+  cline-desktop-linux-headless.service
+  cline-desktop-linux-native.service
+  cline-desktop-headless.service
+  cline-desktop-native.service
+)
+
+usage() {
+  cat <<EOF
+Usage: cline-desktop-linux <command>
+
+Commands:
+  native            Start prebuilt release Tauri desktop
+  desktop           Alias for native
+  browser           Start browser UI and open http://127.0.0.1:3125/ (fallback)
+  headless          Start backend/UI server without opening a browser
+  download-native   Download/verify the tested Native GitHub Release
+  build-native      Build/update the native runtime from current Cline source
+  start             Start DEFAULT_MODE ($DEFAULT_MODE)
+  stop              Stop all Cline Desktop Linux modes
+  restart [mode]    Restart a mode (default: $DEFAULT_MODE)
+  status            Show mode/runtime status
+  logs [mode]       Follow logs for browser/headless or native
+  mode <name>       Set default mode: browser|native|headless
+  doctor            Check source, Bun, ports, Hub and integration config
+
+Native rendering:
+  CLINE_NATIVE_GDK_BACKEND=x11|wayland  Override the Native GDK backend
+EOF
+}
+
+need_source() {
+  [[ -d "$DESKTOP_APP" ]] || { echo "Cline source not found: $CLINE_SOURCE" >&2; exit 1; }
+  [[ -x "$BUN" ]] || { echo "Bun not found: $BUN" >&2; exit 1; }
+  [[ -x "$NODE" ]] || { echo "Node.js not found: ${NODE:-unset}" >&2; exit 1; }
+}
+
+native_cached_revision() {
+  [[ -f "$NATIVE_META" ]] || return 1
+  sed -n 's/^CLINE_REVISION=//p' "$NATIVE_META" | head -n1
+}
+
+build_native() {
+  need_source
+  "$APP_HOME/scripts/build-native.sh" --cline-source "$CLINE_SOURCE" --app-home "$APP_HOME" --bun "$BUN"
+}
+
+download_native() {
+  local args=(--app-home "$APP_HOME" --repo "$NATIVE_RELEASE_REPO")
+  [[ -n "$NATIVE_RELEASE_TAG" ]] && args+=(--tag "$NATIVE_RELEASE_TAG")
+  "$APP_HOME/scripts/download-native-release.sh" "${args[@]}"
+}
+
+ensure_native() {
+  local cached="" source_revision="" tested_revision="${CLINE_TESTED_REVISION:-}"
+  if [[ -z "$tested_revision" && -f "$APP_HOME/compat/cline-tested-revision.txt" ]]; then
+    tested_revision="$(tr -d '[:space:]' < "$APP_HOME/compat/cline-tested-revision.txt")"
+  fi
+  if [[ -d "$CLINE_SOURCE/.git" ]]; then
+    source_revision="$(git -C "$CLINE_SOURCE" rev-parse HEAD 2>/dev/null || true)"
+  fi
+
+  if [[ -x "$NATIVE_BIN" && -x "$NATIVE_SIDECAR" ]]; then
+    cached="$(native_cached_revision 2>/dev/null || true)"
+    if [[ -n "$source_revision" && -n "$cached" && "$cached" == "$source_revision" ]]; then
+      return 0
+    fi
+    if [[ -n "$source_revision" && -n "$tested_revision" &&
+          "$source_revision" != "$tested_revision" && "$cached" == "$tested_revision" ]]; then
+      echo "Cline source ${source_revision:0:12} is newer/different from tested ${tested_revision:0:12}; using the tested cached native release." >&2
+      echo "Run 'cline-desktop-linux build-native' to explicitly build the current compatible-but-untested source." >&2
+      return 0
+    fi
+    if [[ -z "$source_revision" ]]; then
+      echo "Cline source checkout is unavailable; using cached native release ${cached:-unknown}" >&2
+      return 0
+    fi
+  fi
+
+  if [[ "$NATIVE_SOURCE" != build ]]; then
+    if download_native; then
+      echo "Using tested Native GitHub Release." >&2
+      return 0
+    elif [[ "$NATIVE_SOURCE" == prebuilt ]]; then
+      echo "Native prebuilt download failed and NATIVE_SOURCE=prebuilt is strict." >&2
+      exit 1
+    else
+      echo "Native prebuilt is unavailable; falling back to the local source build." >&2
+    fi
+  fi
+
+  if [[ -n "$source_revision" && -n "$tested_revision" && "$source_revision" != "$tested_revision" ]]; then
+    echo "Refusing automatic native build for untested Cline source ${source_revision:0:12} (tested: ${tested_revision:0:12})." >&2
+    echo "Run 'cline-desktop-linux build-native' to explicitly opt in after the compatibility check passes." >&2
+    exit 1
+  fi
+
+  if [[ -n "$source_revision" ]]; then
+    echo "Native release is missing or stale; building for tested Cline ${source_revision:0:12}..."
+  fi
+  build_native
+}
+
+native_runtime_deps_status() {
+  local missing=() pkg
+  command -v pkg-config >/dev/null 2>&1 || missing+=("pkg-config")
+  if command -v pkg-config >/dev/null 2>&1; then
+    for pkg in webkit2gtk-4.1 gtk+-3.0 libsoup-3.0 javascriptcoregtk-4.1; do
+      pkg-config --exists "$pkg" 2>/dev/null || missing+=("$pkg")
+    done
+  fi
+  if ((${#missing[@]} == 0)); then
+    echo "native_runtime_deps=ok"
+  else
+    printf 'native_runtime_deps=missing:'
+    printf ' %s' "${missing[@]}"
+    printf '\n'
+    return 1
+  fi
+}
+
+native_build_deps_status() {
+  local missing=() cmd rust_version rust_minor
+  for cmd in cargo rustc pkg-config ar tar; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if command -v rustc >/dev/null 2>&1; then
+    rust_version="$(rustc --version | awk '{print $2}')"
+    rust_minor="$(printf '%s' "$rust_version" | cut -d. -f2)"
+    if [[ ! "$rust_minor" =~ ^[0-9]+$ ]] || ((rust_minor < 85)); then
+      missing+=("rust>=1.85")
+    fi
+  fi
+  if ((${#missing[@]} == 0)); then echo "native_build_deps=ok"; else printf 'native_build_deps=missing:'; printf ' %s' "${missing[@]}"; printf '\n'; return 1; fi
+}
+
+owned_unmanaged_pid() {
+  local name="$1" pid="$2" cwd cmd exe expected
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$name" in
+    headless)
+      [[ "$cwd" == "$DESKTOP_APP" && "$cmd" == *"$APP_HOME/lib/dev-headless-loopback.ts"* ]]
+      ;;
+    native)
+      exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+      expected="$(readlink -f "$NATIVE_BIN" 2>/dev/null || true)"
+      [[ -n "$expected" && "$exe" == "$expected" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_unmanaged() {
+  for name in native headless; do
+    local f="$STATE_DIR/$name.pid"
+    if [[ -f "$f" ]]; then
+      local pid
+      pid="$(cat "$f" 2>/dev/null || true)"
+      if owned_unmanaged_pid "$name" "$pid"; then
+        kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        for _ in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "ignoring stale $name pid file: process $pid is not owned by cline-desktop-linux" >&2
+      fi
+      rm -f "$f"
+    fi
+  done
+}
+
+stop_legacy_systemd_units() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local unit
+  for unit in "${LEGACY_UNITS[@]}"; do
+    systemctl --user stop "$unit" 2>/dev/null || true
+    systemctl --user disable "$unit" 2>/dev/null || true
+    rm -f "$SYSTEMD_USER_DIR/$unit"
+  done
+  systemctl --user daemon-reload 2>/dev/null || true
+}
+
+stop_all() {
+  stop_legacy_systemd_units
+  stop_unmanaged
+}
+
+wait_http() {
+  for _ in {1..120}; do
+    curl -fsS http://127.0.0.1:3125/ >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  echo "Cline web UI did not become ready on :3125" >&2
+  return 1
+}
+
+start_unmanaged() {
+  local mode="$1"
+  local native_gdk_backend=""
+  stop_all
+  mkdir -p "$STATE_DIR"
+  command -v setsid >/dev/null 2>&1 || { echo "setsid is required" >&2; exit 1; }
+  [[ "$mode" == desktop ]] && mode=native
+  if [[ "$mode" == native ]]; then
+    # WebKitGTK's GTK3 Wayland path can leave text tiles blurry after the
+    # window is resized. Prefer X11 through XWayland when it is available;
+    # keep an explicit escape hatch for systems where Wayland is required.
+    if [[ -n "${CLINE_NATIVE_GDK_BACKEND:-}" ]]; then
+      native_gdk_backend="$CLINE_NATIVE_GDK_BACKEND"
+    elif [[ "${XDG_SESSION_TYPE:-}" == wayland && -n "${DISPLAY:-}" ]]; then
+      native_gdk_backend=x11
+    else
+      native_gdk_backend="${GDK_BACKEND:-wayland,x11}"
+    fi
+    (
+      cd "$CLINE_SOURCE"
+      nohup setsid env GDK_BACKEND="$native_gdk_backend" CLINE_CODE_SIDECAR_BIN="$NATIVE_SIDECAR" \
+        "$NATIVE_BIN" >"$STATE_DIR/native.log" 2>&1 &
+      echo $! >"$STATE_DIR/native.pid"
+    )
+  else
+    (
+      cd "$DESKTOP_APP"
+      nohup setsid env PATH="$RUNTIME_PATH" CLINE_DESKTOP_APP="$DESKTOP_APP" BUN_BIN="$BUN" \
+        "$BUN" "$APP_HOME/lib/dev-headless-loopback.ts" >"$STATE_DIR/headless.log" 2>&1 &
+      echo $! >"$STATE_DIR/headless.pid"
+    )
+  fi
+}
+
+start_mode() {
+  local mode="$1"
+  [[ "$mode" == desktop ]] && mode=native
+  case "$mode" in browser|native|headless) ;; *) echo "Unknown mode: $mode" >&2; exit 2;; esac
+  if [[ "$mode" == native ]]; then ensure_native; else need_source; fi
+  start_unmanaged "$mode"
+  if [[ "$mode" != native ]]; then
+    wait_http
+    if [[ "$mode" == browser ]]; then
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open http://127.0.0.1:3125/ >/dev/null 2>&1 &
+      else
+        echo "Open http://127.0.0.1:3125/ in your browser"
+      fi
+    fi
+  fi
+  echo "started mode=$mode process=direct"
+}
+
+status() {
+  echo "cline_source=$CLINE_SOURCE"
+  echo "default_mode=$DEFAULT_MODE"
+  echo "tested_revision=${CLINE_TESTED_REVISION:-unknown}"
+  echo "source_revision=$(git -C "$CLINE_SOURCE" rev-parse HEAD 2>/dev/null || echo unavailable)"
+  echo "native_revision=$(native_cached_revision 2>/dev/null || echo unavailable)"
+  for name in headless native; do
+    local f="$STATE_DIR/$name.pid"
+    local state=inactive
+    [[ -f "$f" ]] && owned_unmanaged_pid "$name" "$(cat "$f" 2>/dev/null || echo 0)" && state=active
+    echo "${name}_process=$state"
+  done
+  if curl -fsS http://127.0.0.1:3125/ >/dev/null 2>&1; then echo "web_ui=http://127.0.0.1:3125/"; else echo "web_ui=down"; fi
+  if command -v cline >/dev/null 2>&1; then cline doctor 2>/dev/null || true; fi
+}
+
+set_mode() {
+  local mode="${1:-}"
+  [[ "$mode" == desktop ]] && mode=native
+  case "$mode" in browser|native|headless) ;; *) echo "mode must be browser, native, or headless" >&2; exit 2;; esac
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_FILE" ]] && grep -q '^DEFAULT_MODE=' "$CONFIG_FILE"; then
+    sed -i "s/^DEFAULT_MODE=.*/DEFAULT_MODE=$mode/" "$CONFIG_FILE"
+  else
+    printf '\nDEFAULT_MODE=%s\n' "$mode" >> "$CONFIG_FILE"
+  fi
+  echo "default mode: $mode"
+}
+
+logs() {
+  local mode="${1:-$DEFAULT_MODE}"
+  [[ "$mode" == desktop ]] && mode=native
+  if [[ "$mode" == native ]]; then exec tail -f "$STATE_DIR/native.log"; else exec tail -f "$STATE_DIR/headless.log"; fi
+}
+
+doctor() {
+  status
+  [[ -d "$DESKTOP_APP" ]] && echo "source=ok" || echo "source=missing"
+  [[ -x "$BUN" ]] && echo "bun=$($BUN --version)" || echo "bun=missing"
+  [[ -x "$NODE" ]] && echo "node=$($NODE --version)" || echo "node=missing"
+  native_runtime_deps_status || true
+  native_build_deps_status || true
+  ss -ltn 2>/dev/null | grep -E ':(3125|25463)\b' || true
+}
+
+cmd="${1:-start}"; shift || true
+case "$cmd" in
+  browser|native|desktop|headless) start_mode "$cmd" ;;
+  download-native) download_native ;;
+  build-native) build_native ;;
+  start) start_mode "$DEFAULT_MODE" ;;
+  stop) stop_all; echo stopped ;;
+  restart) mode="${1:-$DEFAULT_MODE}"; stop_all; start_mode "$mode" ;;
+  status) status ;;
+  logs) logs "${1:-$DEFAULT_MODE}" ;;
+  mode) set_mode "${1:-}" ;;
+  doctor) doctor ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
