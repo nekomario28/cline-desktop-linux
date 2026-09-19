@@ -1,6 +1,6 @@
 <div align="center">
 
-![Tux leading to the Cline app icon](./assets/cline-linux-hero.png)
+![Linux Cline integration represented by a terminal card and Tux](./assets/cline-linux-hero.png)
 
 <h1>cline-desktop-linux</h1>
 
