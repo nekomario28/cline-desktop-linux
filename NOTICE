@@ -11,14 +11,14 @@ desktop headless launcher to bind the browser/headless UI to loopback. Native
 mode builds an unmodified upstream Tauri release bundle and stages its packaged
 runtime locally. At install time this project may also copy an application icon
 from the user's own upstream Cline checkout for local desktop-menu integration
-only. The README hero is a project-created composition using nominative
-`Cline` text and
-the Tux artwork; it does not contain the upstream Cline source tree or official
-Cline logo artwork and does not imply affiliation, sponsorship, or endorsement
-by Cline Bot Inc.
+only. The unmodified Cline app icon in `assets/cline-app-icon.svg` is reproduced
+from the upstream Cline source solely to identify compatibility. Cline marks
+remain the property of Cline Bot Inc.; this inclusion does not imply affiliation,
+sponsorship, or endorsement. The README hero combines that icon with Tux and
+contains no upstream Cline source tree.
 The Tux artwork in `assets/tux.svg` is included for Linux identification only.
 It is the public-domain vector redrawing by Garrett LeSage, based on the
 original artwork by Larry Ewing and refined by IFo Hancroft; it does not imply
 sponsorship or endorsement by the Linux community or its organizations.
-`assets/cline-linux-hero.png` is a derived raster composition for README
-display.
+`assets/cline-linux-hero.png` is a derived raster composition of the Cline
+icon and Tux for README display.
